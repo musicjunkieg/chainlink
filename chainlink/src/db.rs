@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::models::{Comment, Issue, Session};
 
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 pub struct Database {
     conn: Connection,
@@ -17,6 +17,11 @@ impl Database {
         let db = Database { conn };
         db.init_schema()?;
         Ok(db)
+    }
+
+    /// Access the underlying SQLite connection (used by plugin sync methods).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     /// Execute a closure within a database transaction.
@@ -189,6 +194,40 @@ impl Database {
                 let _ = self
                     .conn
                     .execute("ALTER TABLE sessions ADD COLUMN last_action TEXT", []);
+            }
+
+            // Migration v9: Plugin sync tables for bidirectional integration
+            if version < 9 {
+                self.conn.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS plugin_sync (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        plugin_name TEXT NOT NULL,
+                        local_issue_id INTEGER NOT NULL,
+                        remote_id TEXT NOT NULL,
+                        remote_url TEXT,
+                        remote_etag TEXT,
+                        last_synced_at TEXT NOT NULL,
+                        sync_direction TEXT NOT NULL DEFAULT 'both',
+                        UNIQUE(plugin_name, local_issue_id),
+                        FOREIGN KEY (local_issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                    );
+
+                    CREATE TABLE IF NOT EXISTS plugin_milestone_sync (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        plugin_name TEXT NOT NULL,
+                        local_milestone_id INTEGER NOT NULL,
+                        remote_id TEXT NOT NULL,
+                        last_synced_at TEXT NOT NULL,
+                        UNIQUE(plugin_name, local_milestone_id),
+                        FOREIGN KEY (local_milestone_id) REFERENCES milestones(id) ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_plugin_sync_plugin ON plugin_sync(plugin_name);
+                    CREATE INDEX IF NOT EXISTS idx_plugin_sync_remote ON plugin_sync(plugin_name, remote_id);
+                    CREATE INDEX IF NOT EXISTS idx_plugin_ms_sync_plugin ON plugin_milestone_sync(plugin_name);
+                    "#,
+                )?;
             }
 
             self.conn

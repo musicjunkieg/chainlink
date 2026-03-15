@@ -4,4 +4,5 @@
 
 pub mod db;
 pub mod models;
+pub mod plugin;
 pub mod utils;

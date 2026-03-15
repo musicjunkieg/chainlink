@@ -11,6 +11,7 @@ pub mod label;
 pub mod list;
 pub mod milestone;
 pub mod next;
+pub mod plugin;
 pub mod relate;
 pub mod search;
 pub mod session;

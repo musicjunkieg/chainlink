@@ -2,14 +2,17 @@ mod commands;
 mod daemon;
 mod db;
 mod models;
+mod plugin;
 mod utils;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use db::Database;
+use plugin::config::PluginConfig;
+use plugin::{ChainlinkEvent, PluginManager};
 
 #[derive(Parser)]
 #[command(name = "chainlink")]
@@ -311,6 +314,12 @@ enum Commands {
         #[command(subcommand)]
         action: CpitdCommands,
     },
+
+    /// Plugin management for external integrations (Jira, GitHub, Linear)
+    Plugin {
+        #[command(subcommand)]
+        action: PluginCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -445,6 +454,48 @@ enum DaemonCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum PluginCommands {
+    /// List configured plugins and their status
+    List,
+    /// Configure a plugin (jira, github, linear)
+    Configure {
+        /// Plugin name
+        name: String,
+    },
+    /// Validate plugin configuration and credentials
+    Validate {
+        /// Plugin name (validates all if omitted)
+        name: Option<String>,
+    },
+    /// Run a full bidirectional sync
+    Sync {
+        /// Only sync this plugin
+        #[arg(short, long)]
+        plugin: Option<String>,
+    },
+    /// Show sync status for all plugins
+    Status,
+    /// Manually link a local issue to a remote issue
+    Link {
+        /// Local issue ID
+        id: i64,
+        /// Remote issue ID/key (e.g. "PROJ-123", "42")
+        remote_id: String,
+        /// Plugin name (jira, github, linear)
+        #[arg(short, long)]
+        plugin: String,
+    },
+    /// Remove a sync mapping
+    Unlink {
+        /// Local issue ID
+        id: i64,
+        /// Plugin name (removes all if omitted)
+        #[arg(short, long)]
+        plugin: Option<String>,
+    },
+}
+
 fn find_chainlink_dir() -> Result<PathBuf> {
     let mut current = env::current_dir()?;
 
@@ -464,6 +515,31 @@ fn get_db() -> Result<Database> {
     let chainlink_dir = find_chainlink_dir()?;
     let db_path = chainlink_dir.join("issues.db");
     Database::open(&db_path).context("Failed to open database")
+}
+
+/// Try to load the plugin manager from plugins.toml. Returns None if no config exists.
+fn try_get_plugin_manager(chainlink_dir: &Path) -> Option<PluginManager> {
+    let config_path = chainlink_dir.join("plugins.toml");
+    if !config_path.exists() {
+        return None;
+    }
+    let config = PluginConfig::load(&config_path).ok()?;
+    if !config.has_enabled_plugins() {
+        return None;
+    }
+    PluginManager::from_config(&config).ok()
+}
+
+/// Emit a plugin event if plugins are configured. Non-fatal: errors are printed as warnings.
+fn maybe_emit_event(db: &Database, event: ChainlinkEvent) {
+    if let Ok(chainlink_dir) = find_chainlink_dir() {
+        if let Some(manager) = try_get_plugin_manager(&chainlink_dir) {
+            let errors = manager.emit(&event, db);
+            for err in errors {
+                eprintln!("Warning: plugin sync error: {}", err);
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -496,7 +572,17 @@ fn main() -> Result<()> {
                 &priority,
                 template.as_deref(),
                 &opts,
-            )
+            )?;
+
+            // Emit IssueCreated event for the most recently created issue
+            // The issue ID is the last inserted row
+            if let Ok(issues) = db.list_issues(Some("open"), None, None) {
+                if let Some(issue) = issues.into_iter().rev().find(|i| i.title == title) {
+                    maybe_emit_event(&db, ChainlinkEvent::IssueCreated { issue });
+                }
+            }
+
+            Ok(())
         }
 
         Commands::Quick {
@@ -519,7 +605,15 @@ fn main() -> Result<()> {
                 &priority,
                 template.as_deref(),
                 &opts,
-            )
+            )?;
+
+            if let Ok(issues) = db.list_issues(Some("open"), None, None) {
+                if let Some(issue) = issues.into_iter().rev().find(|i| i.title == title) {
+                    maybe_emit_event(&db, ChainlinkEvent::IssueCreated { issue });
+                }
+            }
+
+            Ok(())
         }
 
         Commands::Subissue {
@@ -543,7 +637,15 @@ fn main() -> Result<()> {
                 description.as_deref(),
                 &priority,
                 &opts,
-            )
+            )?;
+
+            if let Ok(issues) = db.list_issues(Some("open"), None, None) {
+                if let Some(issue) = issues.into_iter().rev().find(|i| i.title == title) {
+                    maybe_emit_event(&db, ChainlinkEvent::IssueCreated { issue });
+                }
+            }
+
+            Ok(())
         }
 
         Commands::List {
@@ -590,17 +692,51 @@ fn main() -> Result<()> {
                 title.as_deref(),
                 description.as_deref(),
                 priority.as_deref(),
-            )
+            )?;
+
+            // Emit update event
+            if let Ok(Some(issue)) = db.get_issue(id) {
+                let mut changed = Vec::new();
+                if title.is_some() {
+                    changed.push("title".to_string());
+                }
+                if description.is_some() {
+                    changed.push("description".to_string());
+                }
+                if priority.is_some() {
+                    changed.push("priority".to_string());
+                }
+                maybe_emit_event(
+                    &db,
+                    ChainlinkEvent::IssueUpdated {
+                        issue,
+                        changed_fields: changed,
+                    },
+                );
+            }
+
+            Ok(())
         }
 
         Commands::Close { id, no_changelog } => {
             let db = get_db()?;
             let chainlink_dir = find_chainlink_dir()?;
+
+            // Get issue before closing for the event
+            let issue_before = db.get_issue(id)?;
+
             if cli.quiet {
-                commands::status::close_quiet(&db, id, !no_changelog, &chainlink_dir)
+                commands::status::close_quiet(&db, id, !no_changelog, &chainlink_dir)?;
             } else {
-                commands::status::close(&db, id, !no_changelog, &chainlink_dir)
+                commands::status::close(&db, id, !no_changelog, &chainlink_dir)?;
             }
+
+            if let Some(mut issue) = issue_before {
+                issue.status = "closed".to_string();
+                maybe_emit_event(&db, ChainlinkEvent::IssueClosed { issue });
+            }
+
+            Ok(())
         }
 
         Commands::CloseAll {
@@ -621,7 +757,13 @@ fn main() -> Result<()> {
 
         Commands::Reopen { id } => {
             let db = get_db()?;
-            commands::status::reopen(&db, id)
+            commands::status::reopen(&db, id)?;
+
+            if let Ok(Some(issue)) = db.get_issue(id) {
+                maybe_emit_event(&db, ChainlinkEvent::IssueReopened { issue });
+            }
+
+            Ok(())
         }
 
         Commands::Delete { id, force } => {
@@ -631,17 +773,52 @@ fn main() -> Result<()> {
 
         Commands::Comment { id, text } => {
             let db = get_db()?;
-            commands::comment::run(&db, id, &text)
+            commands::comment::run(&db, id, &text)?;
+
+            // Emit comment event
+            if let Ok(comments) = db.get_comments(id) {
+                if let Some(comment) = comments.into_iter().last() {
+                    maybe_emit_event(
+                        &db,
+                        ChainlinkEvent::CommentAdded {
+                            issue_id: id,
+                            comment,
+                        },
+                    );
+                }
+            }
+
+            Ok(())
         }
 
         Commands::Label { id, label } => {
             let db = get_db()?;
-            commands::label::add(&db, id, &label)
+            commands::label::add(&db, id, &label)?;
+
+            maybe_emit_event(
+                &db,
+                ChainlinkEvent::LabelAdded {
+                    issue_id: id,
+                    label,
+                },
+            );
+
+            Ok(())
         }
 
         Commands::Unlabel { id, label } => {
             let db = get_db()?;
-            commands::label::remove(&db, id, &label)
+            commands::label::remove(&db, id, &label)?;
+
+            maybe_emit_event(
+                &db,
+                ChainlinkEvent::LabelRemoved {
+                    issue_id: id,
+                    label,
+                },
+            );
+
+            Ok(())
         }
 
         Commands::Block { id, blocker } => {
@@ -740,7 +917,19 @@ fn main() -> Result<()> {
             let db = get_db()?;
             match action {
                 MilestoneCommands::Create { name, description } => {
-                    commands::milestone::create(&db, &name, description.as_deref())
+                    commands::milestone::create(&db, &name, description.as_deref())?;
+
+                    // Emit milestone created event
+                    if let Ok(milestones) = db.list_milestones(Some("open")) {
+                        if let Some(ms) = milestones.into_iter().rev().find(|m| m.name == name) {
+                            maybe_emit_event(
+                                &db,
+                                ChainlinkEvent::MilestoneCreated { milestone: ms },
+                            );
+                        }
+                    }
+
+                    Ok(())
                 }
                 MilestoneCommands::List { status } => commands::milestone::list(&db, Some(&status)),
                 MilestoneCommands::Show { id } => commands::milestone::show(&db, id),
@@ -748,7 +937,18 @@ fn main() -> Result<()> {
                 MilestoneCommands::Remove { id, issue } => {
                     commands::milestone::remove(&db, id, issue)
                 }
-                MilestoneCommands::Close { id } => commands::milestone::close(&db, id),
+                MilestoneCommands::Close { id } => {
+                    commands::milestone::close(&db, id)?;
+
+                    if let Ok(Some(ms)) = db.get_milestone(id) {
+                        maybe_emit_event(
+                            &db,
+                            ChainlinkEvent::MilestoneClosed { milestone: ms },
+                        );
+                    }
+
+                    Ok(())
+                }
                 MilestoneCommands::Delete { id } => commands::milestone::delete(&db, id),
             }
         }
@@ -756,8 +956,75 @@ fn main() -> Result<()> {
         Commands::Session { action } => {
             let db = get_db()?;
             match action {
-                SessionCommands::Start => commands::session::start(&db),
-                SessionCommands::End { notes } => commands::session::end(&db, notes.as_deref()),
+                SessionCommands::Start => {
+                    commands::session::start(&db)?;
+
+                    // Auto-pull from plugins on session start
+                    if let Ok(chainlink_dir) = find_chainlink_dir() {
+                        if let Some(manager) = try_get_plugin_manager(&chainlink_dir) {
+                            if !manager.is_empty() {
+                                println!("Syncing with plugins...");
+                                for (name, result) in manager.pull_all(&db) {
+                                    match result {
+                                        Ok(report) => {
+                                            plugin::sync::print_sync_summary(
+                                                &name,
+                                                report.pulled,
+                                                0,
+                                                &report.errors,
+                                            );
+                                        }
+                                        Err(e) => eprintln!("[{}] Pull failed: {}", name, e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Emit session started event
+                    if let Ok(Some(session)) = db.get_current_session() {
+                        maybe_emit_event(
+                            &db,
+                            ChainlinkEvent::SessionStarted { session },
+                        );
+                    }
+
+                    Ok(())
+                }
+                SessionCommands::End { notes } => {
+                    // Auto-push to plugins on session end
+                    if let Ok(chainlink_dir) = find_chainlink_dir() {
+                        if let Some(manager) = try_get_plugin_manager(&chainlink_dir) {
+                            if !manager.is_empty() {
+                                println!("Pushing changes to plugins...");
+                                for (name, result) in manager.push_all(&db) {
+                                    match result {
+                                        Ok(report) => {
+                                            plugin::sync::print_sync_summary(
+                                                &name,
+                                                0,
+                                                report.pushed,
+                                                &report.errors,
+                                            );
+                                        }
+                                        Err(e) => eprintln!("[{}] Push failed: {}", name, e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    commands::session::end(&db, notes.as_deref())?;
+
+                    if let Ok(Some(session)) = db.get_last_session() {
+                        maybe_emit_event(
+                            &db,
+                            ChainlinkEvent::SessionEnded { session },
+                        );
+                    }
+
+                    Ok(())
+                }
                 SessionCommands::Status => commands::session::status(&db),
                 SessionCommands::Work { id } => commands::session::work(&db, id),
                 SessionCommands::LastHandoff => commands::session::last_handoff(&db),
@@ -792,6 +1059,40 @@ fn main() -> Result<()> {
                 } => commands::cpitd::scan(&db, &paths, min_tokens, &ignore, dry_run, cli.quiet),
                 CpitdCommands::Status => commands::cpitd::status(&db),
                 CpitdCommands::Clear => commands::cpitd::clear(&db),
+            }
+        }
+
+        Commands::Plugin { action } => {
+            let chainlink_dir = find_chainlink_dir()?;
+            match action {
+                PluginCommands::List => commands::plugin::list(&chainlink_dir),
+                PluginCommands::Configure { name } => {
+                    commands::plugin::configure(&chainlink_dir, &name)
+                }
+                PluginCommands::Validate { name } => {
+                    let db = get_db()?;
+                    commands::plugin::validate(&chainlink_dir, name.as_deref(), &db)
+                }
+                PluginCommands::Sync { plugin } => {
+                    let db = get_db()?;
+                    commands::plugin::sync(&chainlink_dir, &db, plugin.as_deref())
+                }
+                PluginCommands::Status => {
+                    let db = get_db()?;
+                    commands::plugin::status(&chainlink_dir, &db)
+                }
+                PluginCommands::Link {
+                    id,
+                    remote_id,
+                    plugin,
+                } => {
+                    let db = get_db()?;
+                    commands::plugin::link(&db, &chainlink_dir, id, &remote_id, &plugin)
+                }
+                PluginCommands::Unlink { id, plugin } => {
+                    let db = get_db()?;
+                    commands::plugin::unlink(&db, id, plugin.as_deref())
+                }
             }
         }
     }
