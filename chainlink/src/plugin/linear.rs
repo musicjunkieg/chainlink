@@ -633,12 +633,14 @@ impl LinearIssuePayload {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct LinearState {
     pub name: String,
     pub r#type: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct LinearCycle {
     pub id: String,
     pub number: i32,

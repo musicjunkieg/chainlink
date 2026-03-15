@@ -594,6 +594,7 @@ impl Plugin for JiraPlugin {
 // ==================== Jira API Response Types ====================
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct JiraIssueResponse {
     pub id: String,
     pub key: String,
@@ -608,6 +609,7 @@ pub struct JiraSearchResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct JiraSearchIssue {
     pub id: String,
     pub key: String,
@@ -615,6 +617,7 @@ pub struct JiraSearchIssue {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct JiraIssueFields {
     pub summary: String,
     pub description: Option<serde_json::Value>,
@@ -679,6 +682,7 @@ pub struct JiraPriority {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct JiraIssueType {
     pub name: String,
 }
