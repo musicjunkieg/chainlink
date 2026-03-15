@@ -1,17 +1,13 @@
 {
-  "tracking_mode": "strict",
+  "tracking_mode": "relaxed",
   "blocked_git_commands": [
-    "git push", "git commit", "git merge", "git rebase", "git cherry-pick",
-    "git reset", "git checkout .", "git restore .", "git clean",
-    "git stash", "git tag", "git am", "git apply",
-    "git branch -d", "git branch -D", "git branch -m"
+    "git reset --hard", "git clean -f", "git checkout .",
+    "git restore .", "git push --force", "git push -f"
   ],
   "allowed_bash_prefixes": [
     "chainlink ",
-    "git status", "git diff", "git log", "git branch", "git show",
-    "cargo test", "cargo build", "cargo check", "cargo clippy", "cargo fmt",
-    "npm test", "npm run", "npx ",
+    "git ", "cargo ", "npm ", "npx ",
     "tsc", "node ", "python ",
-    "ls", "dir", "pwd", "echo"
+    "ls", "dir", "pwd", "echo", "cat ", "mkdir ", "touch "
   ]
 }
